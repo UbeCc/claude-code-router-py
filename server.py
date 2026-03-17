@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from client import ProviderError, post_json, stream_lines
 from config import apply_provider_params, get_provider, load_config, resolve_route
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
+from debug import check_and_save_nonstreaming, check_and_save_streaming
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,7 @@ async def messages(request: Request):
         logger.exception("Unexpected error calling provider")
         raise HTTPException(502, str(exc))
 
+    check_and_save_nonstreaming(openai_req, openai_resp)
     anthropic_resp = openai_to_anthropic(openai_resp, model)
     return anthropic_resp
 
@@ -137,27 +139,45 @@ async def _stream_response(
     max_retries: int,
     timeout: float,
 ) -> AsyncIterator[str]:
+    import json as _json
+    from debug import is_enabled as _debug_enabled
+
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
+    _text_buf: list[str] = [] if _debug_enabled() else []
+
     try:
         lines = stream_lines(url, headers, openai_req, timeout=timeout, max_retries=max_retries)
         async for event in stream_openai_to_anthropic(lines, message_id, model):
+            # Accumulate text for debug check (zero cost when CCR_DEBUG is off
+            # because check_and_save_streaming is a no-op in that case)
+            if _debug_enabled():
+                for line in event.split("\n"):
+                    if line.startswith("data: "):
+                        try:
+                            parsed = _json.loads(line[6:])
+                            delta = parsed.get("delta", {})
+                            if delta.get("type") in ("text_delta", "thinking_delta"):
+                                _text_buf.append(delta.get("text") or delta.get("thinking") or "")
+                        except _json.JSONDecodeError:
+                            pass
             yield event
     except ProviderError as exc:
-        # Emit an Anthropic-format error event
-        import json
         error_event = {
             "type": "error",
             "error": {"type": "api_error", "message": exc.body or str(exc)},
         }
-        yield f"event: error\ndata: {json.dumps(error_event)}\n\n"
+        yield f"event: error\ndata: {_json.dumps(error_event)}\n\n"
+        return
     except Exception as exc:
-        import json
         logger.exception("Streaming error")
         error_event = {
             "type": "error",
             "error": {"type": "api_error", "message": str(exc)},
         }
-        yield f"event: error\ndata: {json.dumps(error_event)}\n\n"
+        yield f"event: error\ndata: {_json.dumps(error_event)}\n\n"
+        return
+
+    check_and_save_streaming(openai_req, "".join(_text_buf))
 
 
 # ---------------------------------------------------------------------------
