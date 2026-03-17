@@ -296,7 +296,9 @@ def _openai_model_to_anthropic(m: dict) -> dict:
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(before_id: str | None = None,
+                      after_id: str | None = None,
+                      limit: int = 20):
     try:
         provider, _, _ = _get_provider()
     except HTTPException:
@@ -305,11 +307,16 @@ async def list_models():
     url = _models_url(provider)
     headers = _provider_headers(provider)
     timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    params: dict = {"limit": limit}
+    if before_id:
+        params["before"] = before_id
+    if after_id:
+        params["after"] = after_id
 
     try:
         import httpx
         async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(url, headers=headers)
+            r = await client.get(url, headers=headers, params=params)
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text)
         data = r.json()
@@ -322,9 +329,9 @@ async def list_models():
     models = [_openai_model_to_anthropic(m) for m in data.get("data", [])]
     return {
         "data": models,
-        "has_more": False,
+        "has_more": data.get("has_more", False),
         "first_id": models[0]["id"] if models else None,
-        "last_id": models[-1]["id"] if models else None,
+        "last_id":  models[-1]["id"] if models else None,
     }
 
 
@@ -626,7 +633,7 @@ async def delete_batch(batch_id: str):
         logger.exception("Batch delete error")
         raise HTTPException(502, str(exc))
 
-    return {"id": batch_id, "type": "message_batch_deleted", "deleted": True}
+    return {"id": batch_id, "type": "message_batch_deleted"}
 
 
 @app.get("/v1/messages/batches/{batch_id}/results")
