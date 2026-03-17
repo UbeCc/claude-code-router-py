@@ -12,6 +12,9 @@ from typing import AsyncIterator
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
+import json
+
+from batch import anthropic_batch_to_openai_jsonl, openai_batch_to_anthropic, openai_results_line_to_anthropic
 from client import ProviderError, post_json, stream_lines
 from config import apply_provider_params, get_provider, load_config, resolve_route
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
@@ -57,7 +60,7 @@ def _provider_headers(provider: dict) -> dict:
     }
 
 
-def _get_provider(anthropic_req: dict):
+def _get_provider(anthropic_req: dict = None):
     """Determine which provider + model to use and return (provider, model, url)."""
     route = resolve_route(_config)
     if route is None:
@@ -69,6 +72,65 @@ def _get_provider(anthropic_req: dict):
         raise HTTPException(500, f"Provider '{provider_name}' not found in config")
 
     return provider, model, provider["api_base_url"]
+
+
+def _api_base(provider: dict) -> str:
+    """Return the base URL (up to and including /v1) for a provider."""
+    url = provider["api_base_url"]
+    for suffix in ("/chat/completions", "/completions", "/models", "/batches", "/files"):
+        if url.endswith(suffix):
+            return url[: -len(suffix)]
+    return url.rsplit("/", 1)[0]
+
+
+def _models_url(provider: dict) -> str:
+    return _api_base(provider) + "/models"
+
+
+def _batches_url(provider: dict) -> str:
+    return _api_base(provider) + "/batches"
+
+
+def _files_url(provider: dict) -> str:
+    return _api_base(provider) + "/files"
+
+
+_tokenizer_cache: dict[str, object] = {}  # tokenizer_path → tokenizer
+
+
+def _get_tokenizer(tokenizer_path: str):
+    if tokenizer_path not in _tokenizer_cache:
+        from transformers import AutoTokenizer
+        _tokenizer_cache[tokenizer_path] = AutoTokenizer.from_pretrained(tokenizer_path)
+        logger.info("Loaded tokenizer from %s", tokenizer_path)
+    return _tokenizer_cache[tokenizer_path]
+
+
+def _extract_text_for_counting(req: dict) -> str:
+    """Flatten all text content in an OpenAI-format request to a single string."""
+    parts: list[str] = []
+    for msg in req.get("messages", []):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif isinstance(block, dict) and block.get("type") == "tool_calls":
+                    parts.append(json.dumps(block, ensure_ascii=False))
+        # tool_calls at message level
+        for tc in msg.get("tool_calls") or []:
+            parts.append(json.dumps(tc.get("function", {}), ensure_ascii=False))
+    for tool in req.get("tools", []):
+        parts.append(json.dumps(tool.get("function", {}), ensure_ascii=False))
+    return "\n".join(parts)
+
+
+def _count_tokens_in_openai_req(req: dict, tokenizer_path: str) -> int:
+    text = _extract_text_for_counting(req)
+    tok = _get_tokenizer(tokenizer_path)
+    return len(tok.encode(text))
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +240,448 @@ async def _stream_response(
         return
 
     check_and_save_streaming(openai_req, "".join(_text_buf))
+
+
+# ---------------------------------------------------------------------------
+# Token counting  POST /v1/messages/count_tokens
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/messages/count_tokens")
+async def count_tokens(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+
+    try:
+        provider, model, _ = _get_provider()
+    except HTTPException:
+        raise
+
+    body = dict(body)
+    body["model"] = model
+
+    openai_req = anthropic_to_openai(body)
+    openai_req = apply_provider_params(provider, openai_req)
+
+    tokenizer_path = provider.get("tokenizer_path") or _config.get("tokenizer_path")
+    if not tokenizer_path:
+        raise HTTPException(501, "Token counting requires tokenizer_path in config")
+    try:
+        input_tokens = _count_tokens_in_openai_req(openai_req, tokenizer_path)
+    except Exception as exc:
+        logger.exception("Token counting error")
+        raise HTTPException(500, f"Token counting failed: {exc}")
+
+    return {"input_tokens": input_tokens}
+
+
+# ---------------------------------------------------------------------------
+# Models  GET /v1/models  and  GET /v1/models/{model_id}
+# ---------------------------------------------------------------------------
+
+def _openai_model_to_anthropic(m: dict) -> dict:
+    import datetime
+    ts = m.get("created", 0)
+    try:
+        created_at = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).isoformat()
+    except Exception:
+        created_at = "1970-01-01T00:00:00+00:00"
+    return {
+        "type": "model",
+        "id": m.get("id", ""),
+        "display_name": m.get("id", ""),
+        "created_at": created_at,
+    }
+
+
+@app.get("/v1/models")
+async def list_models():
+    try:
+        provider, _, _ = _get_provider()
+    except HTTPException:
+        raise
+
+    url = _models_url(provider)
+    headers = _provider_headers(provider)
+    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text)
+        data = r.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Error fetching models")
+        raise HTTPException(502, str(exc))
+
+    models = [_openai_model_to_anthropic(m) for m in data.get("data", [])]
+    return {
+        "data": models,
+        "has_more": False,
+        "first_id": models[0]["id"] if models else None,
+        "last_id": models[-1]["id"] if models else None,
+    }
+
+
+@app.get("/v1/models/{model_id:path}")
+async def get_model(model_id: str):
+    try:
+        provider, _, _ = _get_provider()
+    except HTTPException:
+        raise
+
+    url = _models_url(provider) + f"/{model_id}"
+    headers = _provider_headers(provider)
+    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text)
+        return _openai_model_to_anthropic(r.json())
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Error fetching model %s", model_id)
+        raise HTTPException(502, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Legacy Text Completions  POST /v1/complete
+# ---------------------------------------------------------------------------
+
+def _parse_legacy_prompt(prompt: str) -> list[dict]:
+    """
+    Convert a legacy \n\nHuman: / \n\nAssistant: prompt string into a messages list.
+    Falls back to a single user message if the format is not recognized.
+    """
+    messages = []
+    # Split on alternating Human/Assistant turns
+    import re
+    parts = re.split(r'\n\nHuman: |\n\nAssistant: ', prompt)
+    # Determine if prompt starts with Human or Assistant
+    if '\n\nHuman: ' in prompt:
+        first_role = "user"
+    else:
+        messages.append({"role": "user", "content": prompt.strip()})
+        return messages
+
+    roles = []
+    current = "user"
+    for part in parts:
+        if part.strip():
+            roles.append((current, part.strip()))
+        current = "assistant" if current == "user" else "user"
+
+    for role, content in roles:
+        messages.append({"role": role, "content": content})
+    return messages or [{"role": "user", "content": prompt.strip()}]
+
+
+@app.post("/v1/complete")
+async def legacy_complete(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+
+    try:
+        provider, model, url = _get_provider()
+    except HTTPException:
+        raise
+
+    messages = _parse_legacy_prompt(body.get("prompt", ""))
+    openai_req: dict = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "max_tokens": body.get("max_tokens_to_sample", 1024),
+    }
+    for field in ("temperature", "top_p", "top_k"):
+        if body.get(field) is not None:
+            openai_req[field] = body[field]
+    if body.get("stop_sequences"):
+        openai_req["stop"] = body["stop_sequences"]
+
+    openai_req = apply_provider_params(provider, openai_req)
+    headers = _provider_headers(provider)
+    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+
+    try:
+        openai_resp = await post_json(url, headers, openai_req, timeout=timeout)
+    except ProviderError as exc:
+        raise HTTPException(exc.status or 502, exc.body or str(exc))
+    except Exception as exc:
+        logger.exception("Legacy completion error")
+        raise HTTPException(502, str(exc))
+
+    choice = openai_resp["choices"][0]
+    finish = choice.get("finish_reason", "stop")
+    stop_reason = "max_tokens" if finish == "length" else "stop_sequence"
+    text = (choice.get("message") or {}).get("content") or ""
+
+    return {
+        "id": openai_resp.get("id", f"compl_{uuid.uuid4().hex[:24]}"),
+        "type": "completion",
+        "completion": text,
+        "stop_reason": stop_reason,
+        "model": model,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Batch API
+# ---------------------------------------------------------------------------
+
+async def _httpx_get(url: str, headers: dict, timeout: float) -> dict:
+    import httpx
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.get(url, headers=headers)
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, r.text)
+    return r.json()
+
+
+async def _httpx_delete(url: str, headers: dict, timeout: float) -> dict:
+    import httpx
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.delete(url, headers=headers)
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, r.text)
+    return r.json() if r.text else {}
+
+
+def _self_base_url(request: Request) -> str:
+    return str(request.base_url).rstrip("/")
+
+
+@app.post("/v1/messages/batches")
+async def create_batch(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+
+    try:
+        provider, model, _ = _get_provider()
+    except HTTPException:
+        raise
+
+    requests_list = body.get("requests", [])
+    if not requests_list:
+        raise HTTPException(400, "requests list is empty")
+
+    # Convert to OpenAI JSONL and upload as a file
+    jsonl_content = anthropic_batch_to_openai_jsonl(requests_list, model)
+    jsonl_bytes = jsonl_content.encode()
+
+    headers = _provider_headers(provider)
+    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    files_url = _files_url(provider)
+    batches_url = _batches_url(provider)
+
+    import httpx
+    try:
+        # Upload input file
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(
+                files_url,
+                headers={k: v for k, v in headers.items() if k != "Content-Type"},
+                files={"file": ("batch_input.jsonl", jsonl_bytes, "application/jsonl")},
+                data={"purpose": "batch"},
+            )
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text)
+        file_id = r.json()["id"]
+
+        # Create the batch
+        batch_resp = await post_json(batches_url, headers, {
+            "input_file_id": file_id,
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h",
+        }, timeout=timeout)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Batch create error")
+        raise HTTPException(502, str(exc))
+
+    return openai_batch_to_anthropic(batch_resp, _self_base_url(request))
+
+
+@app.get("/v1/messages/batches")
+async def list_batches(request: Request,
+                       before_id: str | None = None,
+                       after_id: str | None = None,
+                       limit: int = 20):
+    try:
+        provider, _, _ = _get_provider()
+    except HTTPException:
+        raise
+
+    headers = _provider_headers(provider)
+    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+    url = _batches_url(provider)
+    params = {"limit": limit}
+    if before_id:
+        params["before"] = before_id
+    if after_id:
+        params["after"] = after_id
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url, headers=headers, params=params)
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text)
+        data = r.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Batch list error")
+        raise HTTPException(502, str(exc))
+
+    base = _self_base_url(request)
+    batches = [openai_batch_to_anthropic(b, base) for b in data.get("data", [])]
+    return {
+        "data": batches,
+        "has_more": data.get("has_more", False),
+        "first_id": batches[0]["id"] if batches else None,
+        "last_id":  batches[-1]["id"] if batches else None,
+    }
+
+
+@app.get("/v1/messages/batches/{batch_id}")
+async def get_batch(batch_id: str, request: Request):
+    try:
+        provider, _, _ = _get_provider()
+    except HTTPException:
+        raise
+
+    headers = _provider_headers(provider)
+    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+
+    try:
+        data = await _httpx_get(_batches_url(provider) + f"/{batch_id}", headers, timeout)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Batch get error")
+        raise HTTPException(502, str(exc))
+
+    return openai_batch_to_anthropic(data, _self_base_url(request))
+
+
+@app.post("/v1/messages/batches/{batch_id}/cancel")
+async def cancel_batch(batch_id: str, request: Request):
+    try:
+        provider, _, _ = _get_provider()
+    except HTTPException:
+        raise
+
+    headers = _provider_headers(provider)
+    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(
+                _batches_url(provider) + f"/{batch_id}/cancel",
+                headers=headers,
+            )
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text)
+        data = r.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Batch cancel error")
+        raise HTTPException(502, str(exc))
+
+    return openai_batch_to_anthropic(data, _self_base_url(request))
+
+
+@app.delete("/v1/messages/batches/{batch_id}")
+async def delete_batch(batch_id: str):
+    try:
+        provider, _, _ = _get_provider()
+    except HTTPException:
+        raise
+
+    headers = _provider_headers(provider)
+    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+
+    try:
+        await _httpx_delete(_batches_url(provider) + f"/{batch_id}", headers, timeout)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Batch delete error")
+        raise HTTPException(502, str(exc))
+
+    return {"id": batch_id, "type": "message_batch_deleted", "deleted": True}
+
+
+@app.get("/v1/messages/batches/{batch_id}/results")
+async def batch_results(batch_id: str, request: Request):
+    """Stream batch results as Anthropic JSONL (one result per line)."""
+    try:
+        provider, model, _ = _get_provider()
+    except HTTPException:
+        raise
+
+    headers = _provider_headers(provider)
+    timeout: float = _config.get("API_TIMEOUT_MS", 600_000) / 1000
+
+    # Get the batch to find output_file_id
+    try:
+        batch = await _httpx_get(_batches_url(provider) + f"/{batch_id}", headers, timeout)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, str(exc))
+
+    file_id = batch.get("output_file_id")
+    if not file_id:
+        status = batch.get("status", "unknown")
+        raise HTTPException(404, f"Batch results not available yet (status: {status})")
+
+    async def _stream_results():
+        import httpx
+        url = _files_url(provider) + f"/{file_id}/content"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+            async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    yield json.dumps({
+                        "type": "error",
+                        "error": {"type": "api_error", "message": body.decode()},
+                    }) + "\n"
+                    return
+                buffer = ""
+                async for chunk in resp.aiter_text():
+                    buffer += chunk
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        converted = openai_results_line_to_anthropic(line, model)
+                        if converted:
+                            yield converted + "\n"
+                if buffer.strip():
+                    converted = openai_results_line_to_anthropic(buffer, model)
+                    if converted:
+                        yield converted + "\n"
+
+    return StreamingResponse(
+        _stream_results(),
+        media_type="application/x-jsonlines",
+    )
 
 
 # ---------------------------------------------------------------------------
