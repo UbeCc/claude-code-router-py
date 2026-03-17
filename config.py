@@ -1,5 +1,3 @@
-"""Configuration loading and validation."""
-
 import json
 import os
 import re
@@ -31,6 +29,38 @@ def get_provider(config: dict, name: str) -> dict | None:
         if p["name"] == name:
             return p
     return None
+
+
+def apply_provider_params(provider: dict, req: dict) -> dict:
+    """Apply provider-level param defaults/overrides to an OpenAI-format request.
+
+    Supported fields in provider["params"]:
+      temperature  – default if not set in request
+      top_p        – default if not set in request
+      max_tokens   – default, or ceiling if request already has a value
+      reasoning    – dict with budget_tokens; enables thinking if not already set
+    """
+    params = provider.get("params", {})
+    if not params:
+        return req
+
+    for field in ("temperature", "top_p"):
+        if params.get(field) is not None and req.get(field) is None:
+            req[field] = params[field]
+
+    if params.get("max_tokens") is not None:
+        limit = params["max_tokens"]
+        if req.get("max_tokens") is None:
+            req["max_tokens"] = limit
+        else:
+            req["max_tokens"] = min(req["max_tokens"], limit)
+
+    reasoning = params.get("reasoning")
+    if reasoning and req.get("thinking") is None:
+        budget = reasoning.get("budget_tokens", 8000) if isinstance(reasoning, dict) else 8000
+        req["thinking"] = {"type": "enabled", "budget_tokens": budget}
+
+    return req
 
 
 def resolve_route(config: dict, scenario: str = "default") -> tuple[str, str] | None:

@@ -1,23 +1,12 @@
-"""
-Async HTTP client with retry logic for forwarding requests to providers.
-"""
-
 import asyncio
 import logging
-import time
 from typing import AsyncIterator
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# Status codes that are worth retrying
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
-
-
-def _backoff(attempt: int, base: float = 1.0, cap: float = 30.0) -> float:
-    """Exponential backoff: base * 2^attempt, capped."""
-    return min(cap, base * (2 ** attempt))
 
 
 class ProviderError(Exception):
@@ -40,9 +29,8 @@ async def post_json(
     async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(max_retries + 1):
             if attempt > 0:
-                wait = _backoff(attempt - 1)
-                logger.warning("Retry %d/%d after %.1fs", attempt, max_retries, wait)
-                await asyncio.sleep(wait)
+                logger.warning("Retry %d/%d after sleep", attempt, max_retries)
+                await asyncio.sleep(1)
 
             try:
                 resp = await client.post(url, headers=headers, json=body)
@@ -82,9 +70,8 @@ async def stream_lines(
 
     for attempt in range(max_retries + 1):
         if attempt > 0:
-            wait = _backoff(attempt - 1)
-            logger.warning("Stream retry %d/%d after %.1fs", attempt, max_retries, wait)
-            await asyncio.sleep(wait)
+            logger.warning("Stream retry %d/%d after sleep", attempt, max_retries)
+            await asyncio.sleep(1)
 
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:

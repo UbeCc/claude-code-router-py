@@ -110,7 +110,7 @@ def anthropic_to_openai(req: dict) -> dict:
         openai_req["stream_options"] = {"include_usage": True}
 
     # Sampling parameters
-    for field in ("max_tokens", "temperature", "top_p"):
+    for field in ("max_tokens", "temperature", "top_p", "top_k"):
         if req.get(field) is not None:
             openai_req[field] = req[field]
 
@@ -205,7 +205,9 @@ def openai_to_anthropic(resp: dict, original_model: str) -> dict:
         })
 
     usage = resp.get("usage") or {}
-    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+    details = usage.get("prompt_tokens_details") or {}
+    cache_read = details.get("cached_tokens", 0)
+    cache_created = details.get("cache_creation_tokens", 0)
 
     return {
         "id": resp.get("id") or f"msg_{uuid.uuid4().hex[:24]}",
@@ -216,9 +218,10 @@ def openai_to_anthropic(resp: dict, original_model: str) -> dict:
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": max(0, usage.get("prompt_tokens", 0) - cached),
+            "input_tokens": max(0, usage.get("prompt_tokens", 0) - cache_read - cache_created),
             "output_tokens": usage.get("completion_tokens", 0),
-            "cache_read_input_tokens": cached,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_created,
         },
     }
 
@@ -430,16 +433,17 @@ async def stream_openai_to_anthropic(
         })
 
     # --- message_delta + message_stop ---
-    cached = (
-        (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-    )
+    details = (usage.get("prompt_tokens_details") or {})
+    cache_read = details.get("cached_tokens", 0)
+    cache_created = details.get("cache_creation_tokens", 0)
     yield _sse("message_delta", {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
         "usage": {
-            "input_tokens": max(0, usage.get("prompt_tokens", 0) - cached),
+            "input_tokens": max(0, usage.get("prompt_tokens", 0) - cache_read - cache_created),
             "output_tokens": usage.get("completion_tokens", 0),
-            "cache_read_input_tokens": cached,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_created,
         },
     })
     yield _sse("message_stop", {"type": "message_stop"})

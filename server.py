@@ -11,9 +11,8 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from client import ProviderError, post_json, stream_lines
-from config import get_provider, resolve_route
+from config import apply_provider_params, get_provider, resolve_route
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
-from transformers import apply_pipeline, build_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +39,8 @@ def _provider_headers(provider: dict) -> dict:
     }
 
 
-def _get_provider_and_pipeline(anthropic_req: dict):
-    """
-    Determine which provider + model to use and return
-    (provider, model, pipeline, url).
-    """
+def _get_provider(anthropic_req: dict):
+    """Determine which provider + model to use and return (provider, model, url)."""
     route = resolve_route(_config)
     if route is None:
         raise HTTPException(500, "No default route configured")
@@ -54,13 +50,7 @@ def _get_provider_and_pipeline(anthropic_req: dict):
     if provider is None:
         raise HTTPException(500, f"Provider '{provider_name}' not found in config")
 
-    url: str = provider["api_base_url"]
-
-    transformer_cfg = provider.get("transformer", {})
-    use_list = transformer_cfg.get("use", [])
-    pipeline = build_pipeline(use_list)
-
-    return provider, model, pipeline, url
+    return provider, model, provider["api_base_url"]
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +65,7 @@ async def messages(request: Request):
         raise HTTPException(400, "Invalid JSON body")
 
     try:
-        provider, model, pipeline, url = _get_provider_and_pipeline(body)
+        provider, model, url = _get_provider(body)
     except HTTPException:
         raise
     except Exception as exc:
@@ -86,11 +76,9 @@ async def messages(request: Request):
     body = dict(body)
     body["model"] = model
 
-    # Anthropic → OpenAI
+    # Anthropic → OpenAI, then apply provider param defaults
     openai_req = anthropic_to_openai(body)
-
-    # Apply transformer pipeline
-    openai_req = apply_pipeline(pipeline, openai_req)
+    openai_req = apply_provider_params(provider, openai_req)
 
     headers = _provider_headers(provider)
     max_retries: int = provider.get("max_retries", 3)
