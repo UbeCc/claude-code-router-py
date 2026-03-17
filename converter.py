@@ -120,36 +120,65 @@ def anthropic_to_openai(req: dict) -> dict:
 
     # Tools
     if req.get("tools"):
-        openai_req["tools"] = [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "parameters": t.get("input_schema", {}),
-                },
+        openai_req["tools"] = []
+        for t in req["tools"]:
+            fn: dict = {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {}),
             }
-            for t in req["tools"]
-        ]
+            if t.get("strict") is not None:
+                fn["strict"] = t["strict"]
+            openai_req["tools"].append({"type": "function", "function": fn})
 
     # Tool choice
     tc = req.get("tool_choice")
     if tc:
-        t = tc.get("type")
-        if t == "auto":
+        tc_type = tc.get("type")
+        if tc_type == "auto":
             openai_req["tool_choice"] = "auto"
-        elif t == "any":
+        elif tc_type == "any":
             openai_req["tool_choice"] = "required"
-        elif t == "tool":
+        elif tc_type == "tool":
             openai_req["tool_choice"] = {
                 "type": "function",
                 "function": {"name": tc["name"]},
             }
+        elif tc_type == "none":
+            openai_req["tool_choice"] = "none"
+        # disable_parallel_tool_use on any variant
+        if tc.get("disable_parallel_tool_use"):
+            openai_req["parallel_tool_calls"] = False
 
     # Thinking / extended reasoning
+    # enabled  → forward as-is (budget_tokens required by Anthropic spec)
+    # adaptive → forward as-is (no budget_tokens; provider decides)
+    # disabled → omit (no thinking field sent)
     thinking = req.get("thinking")
-    if thinking and thinking.get("type") == "enabled":
-        openai_req["thinking"] = thinking
+    if thinking:
+        t_type = thinking.get("type")
+        if t_type in ("enabled", "adaptive"):
+            openai_req["thinking"] = thinking
+        # type == "disabled": intentionally omitted
+
+    # output_config: effort → reasoning_effort, format → response_format
+    output_config = req.get("output_config") or {}
+    effort = output_config.get("effort")
+    if effort is not None:
+        # Anthropic: low / medium / high / max
+        # OpenAI:    low / medium / high / xhigh
+        openai_req["reasoning_effort"] = "xhigh" if effort == "max" else effort
+    fmt = output_config.get("format")
+    if fmt and fmt.get("type") == "json_schema":
+        openai_req["response_format"] = {
+            "type": "json_schema",
+            "json_schema": fmt.get("schema", {}),
+        }
+
+    # metadata.user_id → user
+    user_id = (req.get("metadata") or {}).get("user_id")
+    if user_id:
+        openai_req["user"] = user_id
 
     return openai_req
 

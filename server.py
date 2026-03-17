@@ -4,27 +4,44 @@ to an OpenAI-compatible provider, converting formats in both directions.
 """
 
 import logging
+import os
 import uuid
+from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from client import ProviderError, post_json, stream_lines
-from config import apply_provider_params, get_provider, resolve_route
+from config import apply_provider_params, get_provider, load_config, resolve_route
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Claude Code Router (Python)")
-
-# Populated by main.py before server starts
+# Populated either by set_config() (single-process) or lifespan (multi-worker).
 _config: dict = {}
 
 
 def set_config(cfg: dict) -> None:
     global _config
     _config = cfg
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _config
+    if not _config:
+        path = os.environ.get("CCR_CONFIG", "config.json")
+        try:
+            _config = load_config(path)
+            logger.info("Config loaded from %s (worker pid=%d)", path, os.getpid())
+        except Exception as exc:
+            logger.error("Failed to load config %s: %s", path, exc)
+            raise
+    yield
+
+
+app = FastAPI(title="Claude Code Router (Python)", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
