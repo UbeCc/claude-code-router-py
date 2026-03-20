@@ -56,7 +56,7 @@ def apply_provider_params(provider: dict, req: dict) -> dict:
             req["max_tokens"] = min(req["max_tokens"], limit)
 
     reasoning = params.get("reasoning")
-    if reasoning and req.get("thinking") is None:
+    if reasoning and req.get("thinking") is None and not req.get("tools"):
         budget = reasoning.get("budget_tokens", 8000) if isinstance(reasoning, dict) else 8000
         req["thinking"] = {"type": "enabled", "budget_tokens": budget}
 

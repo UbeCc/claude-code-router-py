@@ -415,6 +415,14 @@ async def stream_openai_to_anthropic(
                         "index": text_idx,
                     })
                     text_idx = -1
+                # Close the previously open tool block (if any) before opening a new one
+                if tool_blocks:
+                    last_tb = list(tool_blocks.values())[-1]
+                    yield _sse("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": last_tb["block_idx"],
+                    })
+                    last_tb["closed"] = True
 
                 block_idx = content_index
                 content_index += 1
@@ -460,10 +468,11 @@ async def stream_openai_to_anthropic(
             "index": text_idx,
         })
     for tb in tool_blocks.values():
-        yield _sse("content_block_stop", {
-            "type": "content_block_stop",
-            "index": tb["block_idx"],
-        })
+        if not tb.get("closed"):
+            yield _sse("content_block_stop", {
+                "type": "content_block_stop",
+                "index": tb["block_idx"],
+            })
 
     # --- message_delta + message_stop ---
     details = (usage.get("prompt_tokens_details") or {})

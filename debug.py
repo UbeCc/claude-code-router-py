@@ -72,6 +72,17 @@ def save_dump(openai_req: dict, response_obj: object, label: str = "") -> None:
         logger.error("CCR_DEBUG: failed to write dump %s: %s", path, exc)
 
 
+def log_openai_request(openai_req: dict) -> None:
+    """Print the converted OpenAI request to stdout when CCR_DEBUG is enabled."""
+    if not is_enabled():
+        return
+    print(
+        "CCR_DEBUG [openai_req]:\n"
+        + json.dumps(openai_req, ensure_ascii=False, indent=2),
+        flush=True,
+    )
+
+
 def check_and_save_nonstreaming(openai_req: dict, openai_resp: dict) -> None:
     """Check a non-streaming OpenAI response and dump if sensitive tokens found."""
     if not is_enabled():

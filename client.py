@@ -18,7 +18,7 @@ def get_shared_client() -> httpx.AsyncClient:
     """Return the shared HTTP client (connection pooling). Created lazily."""
     global _shared_client
     if _shared_client is None:
-        _shared_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0))
+        _shared_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0), trust_env=False)
     return _shared_client
 
 
@@ -113,7 +113,7 @@ async def open_provider_stream(
             logger.warning("Stream retry %d/%d after sleep", attempt, max_retries)
             await asyncio.sleep(1)
 
-        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
+        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout), trust_env=False)
         try:
             req = client.build_request("POST", url, headers=headers, json=body)
             resp = await client.send(req, stream=True)

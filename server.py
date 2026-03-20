@@ -18,7 +18,7 @@ from batch import anthropic_batch_to_openai_jsonl, openai_batch_to_anthropic, op
 from client import ProviderError, ProviderStream, close_shared_client, get_shared_client, open_provider_stream, post_json
 from config import apply_provider_params, get_provider, load_config, resolve_route
 from converter import anthropic_to_openai, openai_to_anthropic, stream_openai_to_anthropic
-from debug import check_and_save_nonstreaming, check_and_save_streaming
+from debug import check_and_save_nonstreaming, check_and_save_streaming, log_openai_request
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +167,7 @@ async def messages(request: Request):
     # Anthropic → OpenAI, then apply provider param defaults
     openai_req = anthropic_to_openai(body)
     openai_req = apply_provider_params(provider, openai_req)
+    log_openai_request(openai_req)
 
     headers = _provider_headers(provider)
     max_retries: int = provider.get("max_retries", 3)
@@ -503,7 +504,7 @@ async def create_batch(request: Request):
 
     try:
         # Upload input file (use a fresh client for multipart upload)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             r = await client.post(
                 files_url,
                 headers={k: v for k, v in headers.items() if k != "Content-Type"},
@@ -663,7 +664,7 @@ async def batch_results(batch_id: str, request: Request):
 
     async def _stream_results():
         url = _files_url(provider) + f"/{file_id}/content"
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout), trust_env=False) as client:
             async with client.stream("GET", url, headers=headers) as resp:
                 if resp.status_code >= 400:
                     body = await resp.aread()
