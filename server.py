@@ -35,13 +35,18 @@ def set_config(cfg: dict) -> None:
 async def lifespan(app: FastAPI):
     global _config
     if not _config:
-        path = os.environ.get("CCR_CONFIG", "config.json")
-        try:
-            _config = load_config(path)
-            logger.info("Config loaded from %s (worker pid=%d)", path, os.getpid())
-        except Exception as exc:
-            logger.error("Failed to load config %s: %s", path, exc)
-            raise
+        if inline := os.environ.get("CCR_CONFIG_JSON"):
+            import json as _json
+            _config = _json.loads(inline)
+            logger.info("Config loaded from CCR_CONFIG_JSON (worker pid=%d)", os.getpid())
+        else:
+            path = os.environ.get("CCR_CONFIG", "config.json")
+            try:
+                _config = load_config(path)
+                logger.info("Config loaded from %s (worker pid=%d)", path, os.getpid())
+            except Exception as exc:
+                logger.error("Failed to load config %s: %s", path, exc)
+                raise
     yield
     await close_shared_client()
 
