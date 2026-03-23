@@ -31,6 +31,39 @@ def set_config(cfg: dict) -> None:
     _config = cfg
 
 
+def _build_config_from_env() -> dict | None:
+    """Build config from individual CCR_* env vars (for gunicorn -e usage).
+    Returns None if CCR_API_BASE_URL is not set."""
+    api_base_url = os.environ.get("CCR_API_BASE_URL")
+    if not api_base_url:
+        return None
+
+    params: dict = {}
+    if (v := os.environ.get("CCR_TEMPERATURE")) is not None:
+        params["temperature"] = float(v)
+    if (v := os.environ.get("CCR_TOP_P")) is not None:
+        params["top_p"] = float(v)
+    if (v := os.environ.get("CCR_MAX_TOKENS")) is not None:
+        params["max_tokens"] = int(v)
+    if (v := os.environ.get("CCR_BUDGET_TOKENS")) is not None:
+        params["reasoning"] = {"budget_tokens": int(v)}
+
+    provider: dict = {
+        "name": "default",
+        "api_base_url": api_base_url,
+        "api_key": os.environ.get("CCR_API_KEY") or os.environ.get("API_KEY", ""),
+        "max_retries": int(os.environ.get("CCR_MAX_RETRIES", "3")),
+    }
+    if params:
+        provider["params"] = params
+
+    return {
+        "API_TIMEOUT_MS": int(os.environ.get("CCR_API_TIMEOUT_MS", "850000")),
+        "Providers": [provider],
+        "Router": {"default": f"default,{os.environ.get('CCR_MODEL', '/model')}"},
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _config
@@ -39,6 +72,9 @@ async def lifespan(app: FastAPI):
             import json as _json
             _config = _json.loads(inline)
             logger.info("Config loaded from CCR_CONFIG_JSON (worker pid=%d)", os.getpid())
+        elif cfg := _build_config_from_env():
+            _config = cfg
+            logger.info("Config loaded from CCR_* env vars (worker pid=%d)", os.getpid())
         else:
             path = os.environ.get("CCR_CONFIG", "config.json")
             try:
@@ -65,10 +101,10 @@ def _timeout() -> float:
 
 def _provider_headers(provider: dict) -> dict:
     api_key = provider.get("api_key", "")
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 def _get_provider(anthropic_req: dict = None):
