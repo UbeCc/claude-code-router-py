@@ -70,8 +70,11 @@ async def lifespan(app: FastAPI):
     if not _config:
         if inline := os.environ.get("CCR_CONFIG_JSON"):
             import json as _json
-            _config = _json.loads(inline)
-            logger.info("Config loaded from CCR_CONFIG_JSON (worker pid=%d)", os.getpid())
+            try:
+                _config = _json.loads(inline)
+                logger.info("Config loaded from CCR_CONFIG_JSON (worker pid=%d)", os.getpid())
+            except Exception as exc:
+                logger.error("Failed to parse CCR_CONFIG_JSON: %s", exc)
         elif cfg := _build_config_from_env():
             _config = cfg
             logger.info("Config loaded from CCR_* env vars (worker pid=%d)", os.getpid())
@@ -82,7 +85,8 @@ async def lifespan(app: FastAPI):
                 logger.info("Config loaded from %s (worker pid=%d)", path, os.getpid())
             except Exception as exc:
                 logger.error("Failed to load config %s: %s", path, exc)
-                raise
+    if not _config:
+        logger.warning("No config loaded — routes are registered but all proxy endpoints will return 500")
     yield
     await close_shared_client()
 
@@ -323,6 +327,36 @@ async def count_tokens(request: Request):
         raise HTTPException(500, f"Token counting failed: {exc}")
 
     return {"input_tokens": input_tokens}
+
+
+# ---------------------------------------------------------------------------
+# Proxy POST /tokens/clear to upstream adapter
+# ---------------------------------------------------------------------------
+
+@app.post("/tokens/clear")
+async def tokens_clear(request: Request):
+    """Proxy /tokens/clear to the upstream chat_to_generate_adapter."""
+    body = await request.json()
+    provider, model, _ = _get_provider()
+    api_base = _api_base(provider)
+    # Strip /v1 (with or without trailing slash) to get the adapter root
+    adapter_root = api_base.removesuffix("/v1").removesuffix("/")
+    url = f"{adapter_root}/tokens/clear"
+    api_key = provider.get("api_key", "")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+            resp = await client.post(
+                url,
+                json=body,
+                headers=headers,
+            )
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+    except Exception as exc:
+        logger.exception("tokens/clear proxy error")
+        raise HTTPException(502, f"Upstream /tokens/clear failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -740,3 +774,8 @@ async def batch_results(batch_id: str, request: Request):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=8891, timeout_keep_alive=1500, reload=False)

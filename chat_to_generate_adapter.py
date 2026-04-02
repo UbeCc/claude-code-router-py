@@ -473,6 +473,27 @@ class ChatToGenerateAdapter:
             },
         )
 
+    @staticmethod
+    def _normalize_tool_calls_to_openai(raw_tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert flat tool_calls from parse_message_local to nested OpenAI streaming format.
+
+        Flat:  {"tool_call_id": "xxx", "name": "Read", "arguments": "{...}"}
+        OpenAI: {"id": "xxx", "type": "function", "function": {"name": "Read", "arguments": "{...}"}}
+        """
+        result = []
+        for tc in raw_tool_calls:
+            tc_id = tc.get("id") or tc.get("tool_call_id") or f"call_{uuid.uuid4().hex[:24]}"
+            name = tc.get("name", "")
+            arguments = tc.get("arguments", "{}")
+            if isinstance(arguments, dict):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            result.append({
+                "id": tc_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            })
+        return result
+
     def _chat_chunk_sse(
         self,
         request_id: str,
@@ -482,12 +503,15 @@ class ChatToGenerateAdapter:
         reasoning_content: Optional[str] = None,
         finish_reason: Optional[str] = None,
         usage: Optional[Dict[str, Any]] = None,
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         delta: Dict[str, Any] = {}
         if content:
             delta["content"] = content
         if reasoning_content:
             delta["reasoning_content"] = reasoning_content
+        if tool_calls:
+            delta["tool_calls"] = tool_calls
 
         payload: Dict[str, Any] = {
             "id": f"chatcmpl-{request_id}",
@@ -566,6 +590,11 @@ class ChatToGenerateAdapter:
         }
         finish_reason = meta_info.get("finish_reason", {}).get("type", "stop")
 
+        raw_tool_calls = parsed.get("tool_calls", [])
+        openai_tool_calls = self._normalize_tool_calls_to_openai(raw_tool_calls) if raw_tool_calls else []
+        if openai_tool_calls:
+            finish_reason = "tool_calls"
+
         async def iterator():
             if reasoning_content:
                 yield self._chat_chunk_sse(
@@ -576,6 +605,13 @@ class ChatToGenerateAdapter:
                 )
             if content:
                 yield self._chat_chunk_sse(request_id, created, self.model, content=content)
+            if openai_tool_calls:
+                yield self._chat_chunk_sse(
+                    request_id,
+                    created,
+                    self.model,
+                    tool_calls=openai_tool_calls,
+                )
             yield self._chat_chunk_sse(
                 request_id,
                 created,
@@ -605,7 +641,13 @@ class ChatToGenerateAdapter:
         request_id = str(uuid.uuid4())
         created = int(time.time())
 
+        # Get tools from the original chat request for parsing
+        chat_tools = completions_request.pop("_chat_tools", [])
+
         async def iterator():
+            text_buf = []
+            last_usage = None
+            last_finish_reason = None
             try:
                 async for raw in stream:
                     line = raw.decode("utf-8", errors="ignore").strip()
@@ -613,6 +655,26 @@ class ChatToGenerateAdapter:
                         continue
                     payload = line[6:]
                     if payload == "[DONE]":
+                        # Parse accumulated text for tool calls
+                        if chat_tools and text_buf:
+                            full_text = "".join(text_buf)
+                            full_text = full_text.rstrip()
+                            if full_text.endswith("(prompt"):
+                                full_text = full_text[:-8].rstrip()
+                            full_text = f"\U0001f508{full_text}"
+                            parsed = parse_message_local(full_text, "glm47", chat_tools)
+                            raw_tcs = parsed.get("tool_calls", [])
+                            openai_tcs = self._normalize_tool_calls_to_openai(raw_tcs) if raw_tcs else []
+                            if openai_tcs:
+                                yield self._chat_chunk_sse(
+                                    request_id, created, self.model, tool_calls=openai_tcs,
+                                )
+                                last_finish_reason = "tool_calls"
+                        yield self._chat_chunk_sse(
+                            request_id, created, self.model,
+                            finish_reason=last_finish_reason,
+                            usage=last_usage,
+                        )
                         yield "data: [DONE]\n\n"
                         return
 
@@ -631,15 +693,14 @@ class ChatToGenerateAdapter:
                     usage = chunk.get("usage")
 
                     if text:
-                        yield self._chat_chunk_sse(request_id, created, self.model, content=text)
+                        text_buf.append(text)
+                        # If we have tools, buffer text; otherwise stream immediately
+                        if not chat_tools:
+                            yield self._chat_chunk_sse(request_id, created, self.model, content=text)
                     if finish_reason is not None:
-                        yield self._chat_chunk_sse(
-                            request_id,
-                            created,
-                            self.model,
-                            finish_reason=finish_reason,
-                            usage=usage,
-                        )
+                        last_finish_reason = finish_reason
+                    if usage:
+                        last_usage = usage
             finally:
                 await stream.aclose()
 
@@ -912,7 +973,18 @@ class ChatToGenerateAdapter:
         if main_key is not None:
             completions_request["main_key"] = main_key
 
+        # Build tool definitions for parser (used by both streaming and non-streaming)
+        tools_for_parser = []
+        for tool in chat_request.get("tools", []):
+            if "function" in tool:
+                tool_to_dump = tool["function"]
+            else:
+                tool_to_dump = tool
+            tools_for_parser.append(tool_to_dump)
+
         if completions_request["stream"]:
+            # Pass tool definitions so the streaming path can parse tool XML
+            completions_request["_chat_tools"] = tools_for_parser
             return await self._stream_completions_to_chat(completions_request, request_headers)
 
         completions_response = await self._process_completions_via_v1(completions_request, request_headers)
@@ -931,14 +1003,6 @@ class ChatToGenerateAdapter:
             completion_text = completion_text[:-8].rstrip()
 
         completion_text = f"<think>{completion_text}"
-        
-        tools_for_parser = []
-        for tool in chat_request.get("tools", []):
-            if "function" in tool:
-                tool_to_dump = tool["function"]
-            else:
-                tool_to_dump = tool
-            tools_for_parser.append(tool_to_dump)
         
         parsed = parse_message_local(completion_text, "glm47", tools_for_parser)
 
