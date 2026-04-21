@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from typing import AsyncIterator
 
 import httpx
@@ -18,7 +19,11 @@ def get_shared_client() -> httpx.AsyncClient:
     """Return the shared HTTP client (connection pooling). Created lazily."""
     global _shared_client
     if _shared_client is None:
-        _shared_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0), trust_env=False)
+        _shared_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0),
+            trust_env=False,
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
+        )
     return _shared_client
 
 
@@ -104,29 +109,44 @@ async def post_json(
     last_exc: Exception | None = None
     client = get_shared_client()
 
+    req_model = body.get("model", "?")
+    req_stream = body.get("stream", False)
+    logger.info("[post_json] >>> POST %s model=%s stream=%s", url, req_model, req_stream)
+
     for attempt in range(max_retries + 1):
         if attempt > 0:
             logger.warning("Retry %d/%d after sleep", attempt, max_retries)
             await asyncio.sleep(1)
 
+        t0 = time.monotonic()
         try:
             resp = await client.post(url, headers=headers, json=body, timeout=timeout)
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+            elapsed = time.monotonic() - t0
             last_exc = exc
-            logger.warning("Connection error (attempt %d): %s", attempt + 1, exc)
+            logger.warning(
+                "[post_json] Connection error (attempt %d) after %.2fs: %s",
+                attempt + 1, elapsed, exc,
+            )
             continue
 
+        elapsed = time.monotonic() - t0
         if resp.status_code in _RETRY_STATUSES and attempt < max_retries:
             logger.warning(
-                "HTTP %d from provider (attempt %d), will retry",
-                resp.status_code, attempt + 1,
+                "[post_json] HTTP %d from provider (attempt %d) after %.2fs, will retry. body=%s",
+                resp.status_code, attempt + 1, elapsed, resp.text[:500],
             )
             last_exc = ProviderError(resp.status_code, resp.text)
             continue
 
         if resp.status_code >= 400:
+            logger.error(
+                "[post_json] <<< HTTP %d after %.2fs body=%s",
+                resp.status_code, elapsed, resp.text[:500],
+            )
             raise ProviderError(resp.status_code, resp.text)
 
+        logger.info("[post_json] <<< HTTP %d after %.2fs", resp.status_code, elapsed)
         return resp.json()
 
     raise last_exc or ProviderError(0, "Unknown error after retries")
@@ -146,6 +166,8 @@ async def open_provider_stream(
     Retries on transient errors before raising.
     """
     last_exc: Exception | None = None
+    req_model = body.get("model", "?")
+    logger.info("[stream] >>> POST %s model=%s (stream)", url, req_model)
 
     async def _connect() -> tuple[httpx.Response, httpx.AsyncClient]:
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout), trust_env=False)
@@ -159,20 +181,26 @@ async def open_provider_stream(
 
     for attempt in range(max_retries + 1):
         if attempt > 0:
-            logger.warning("Stream retry %d/%d after sleep", attempt, max_retries)
+            logger.warning("[stream] Stream retry %d/%d after sleep", attempt, max_retries)
             await asyncio.sleep(1)
 
+        t0 = time.monotonic()
         try:
             resp, client = await _connect()
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
+            elapsed = time.monotonic() - t0
             last_exc = exc
-            logger.warning("Stream connection error (attempt %d): %s", attempt + 1, exc)
+            logger.warning(
+                "[stream] Connection error (attempt %d) after %.2fs: %s",
+                attempt + 1, elapsed, exc,
+            )
             continue
 
+        elapsed = time.monotonic() - t0
         if resp.status_code in _RETRY_STATUSES and attempt < max_retries:
             logger.warning(
-                "HTTP %d from provider (stream attempt %d), will retry",
-                resp.status_code, attempt + 1,
+                "[stream] HTTP %d from provider (attempt %d) after %.2fs, will retry",
+                resp.status_code, attempt + 1, elapsed,
             )
             last_exc = ProviderError(resp.status_code, "")
             await resp.aclose()
@@ -183,8 +211,13 @@ async def open_provider_stream(
             body_text = await resp.aread()
             await resp.aclose()
             await client.aclose()
+            logger.error(
+                "[stream] <<< HTTP %d after %.2fs body=%s",
+                resp.status_code, elapsed, body_text.decode()[:500],
+            )
             raise ProviderError(resp.status_code, body_text.decode())
 
+        logger.info("[stream] <<< HTTP %d connected after %.2fs", resp.status_code, elapsed)
         return ProviderStream(
             resp,
             client,

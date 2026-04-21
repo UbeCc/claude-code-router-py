@@ -1,2 +1,3 @@
 .venv/
+claude-code-router-rs/target/
 **/__pycache__/

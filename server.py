@@ -6,9 +6,18 @@ to an OpenAI-compatible provider, converting formats in both directions.
 import json
 import logging
 import os
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
+
+# Ensure logs are visible under gunicorn/uvicorn workers
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(process)d] %(levelname)s %(name)s - %(message)s",
+    stream=sys.stderr,
+    force=True,
+)
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -161,7 +170,7 @@ _tokenizer_cache: dict[str, object] = {}  # tokenizer_path → tokenizer
 def _get_tokenizer(tokenizer_path: str):
     if tokenizer_path not in _tokenizer_cache:
         from transformers import AutoTokenizer
-        _tokenizer_cache[tokenizer_path] = AutoTokenizer.from_pretrained(tokenizer_path)
+        _tokenizer_cache[tokenizer_path] = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
         logger.info("Loaded tokenizer from %s", tokenizer_path)
     return _tokenizer_cache[tokenizer_path]
 
@@ -197,8 +206,36 @@ def _count_tokens_in_openai_req(req: dict, tokenizer_path: str) -> int:
 # Main endpoint
 # ---------------------------------------------------------------------------
 
+import asyncio as _asyncio
+import time as _time
+_inflight = 0  # per-worker in-flight request counter
+_total_requests = 0  # per-worker total request counter
+_start_time = _time.monotonic()
+
+@app.get("/stats")
+async def stats():
+    """Per-worker stats — hit multiple times to see all workers."""
+    return {
+        "pid": os.getpid(),
+        "inflight": _inflight,
+        "total_requests": _total_requests,
+        "uptime_s": round(_time.monotonic() - _start_time, 1),
+    }
+
 @app.post("/v1/messages")
 async def messages(request: Request):
+    global _inflight, _total_requests
+    _inflight += 1
+    _total_requests += 1
+    logger.info("[messages] +++ in-flight=%d (pid=%d)", _inflight, os.getpid())
+    try:
+        return await _handle_messages(request)
+    finally:
+        _inflight -= 1
+        logger.info("[messages] --- in-flight=%d (pid=%d)", _inflight, os.getpid())
+
+
+async def _handle_messages(request: Request):
     try:
         body = await request.json()
     except Exception:
