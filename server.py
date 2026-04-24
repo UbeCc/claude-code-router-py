@@ -812,6 +812,77 @@ async def batch_results(batch_id: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Raw passthrough  POST /generate
+# ---------------------------------------------------------------------------
+
+@app.post("/generate")
+async def generate_passthrough(request: Request):
+    """
+    Forward the request body as-is to `{target}/generate`.
+
+    Target upstream can be specified (in priority order):
+      - query param ?target=http://ip:port
+      - header X-Target-Url: http://ip:port
+      - env var CCR_GENERATE_TARGET
+    The path may include or omit a trailing /generate.
+    """
+    target = (
+        request.query_params.get("target")
+        or request.headers.get("x-target-url")
+        or os.environ.get("CCR_GENERATE_TARGET")
+    )
+    if not target:
+        raise HTTPException(400, "Missing upstream target (query ?target=, header X-Target-Url, or env CCR_GENERATE_TARGET)")
+
+    target = target.rstrip("/")
+    if not target.endswith("/generate"):
+        target = target + "/generate"
+
+    body_bytes = await request.body()
+
+    fwd_headers: dict[str, str] = {}
+    for k, v in request.headers.items():
+        lk = k.lower()
+        if lk in ("host", "content-length", "x-target-url", "connection", "accept-encoding"):
+            continue
+        fwd_headers[k] = v
+    fwd_headers.setdefault("Content-Type", "application/json")
+
+    try:
+        body_json = json.loads(body_bytes) if body_bytes else {}
+        is_stream = bool(body_json.get("stream"))
+    except Exception:
+        is_stream = False
+
+    timeout = _timeout()
+
+    if is_stream:
+        async def _proxy_stream():
+            client = httpx.AsyncClient(timeout=httpx.Timeout(timeout), trust_env=False)
+            try:
+                async with client.stream("POST", target, content=body_bytes, headers=fwd_headers) as resp:
+                    async for chunk in resp.aiter_raw():
+                        yield chunk
+            finally:
+                await client.aclose()
+
+        return StreamingResponse(_proxy_stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            r = await client.post(target, content=body_bytes, headers=fwd_headers)
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            media_type=r.headers.get("content-type", "application/json"),
+        )
+    except Exception as exc:
+        logger.exception("/generate proxy error")
+        raise HTTPException(502, f"Upstream /generate failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
 

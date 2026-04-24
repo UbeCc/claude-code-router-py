@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s http://localhost:8891/openapi.json)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); p=d.get\\(''''paths'''',{}\\); print\\(json.dumps\\(p.get\\(''''/tokens/clear'''',''''NOT FOUND''''\\), indent=2\\)\\)\")"
+    ]
+  }
+}
